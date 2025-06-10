@@ -1,4 +1,3 @@
-# src/coding_agent/code_generator.py
 from python_a2a import A2AServer, skill, agent, run_server, TaskStatus, TaskState
 from src.utils import setup_logging, parse_task_message
 import re

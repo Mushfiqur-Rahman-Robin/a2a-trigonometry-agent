@@ -1,5 +1,3 @@
-# src/local_llm.py (or just local_llm.py if it's in root)
-
 from python_a2a import A2AClient, run_server
 from python_a2a.langchain import to_a2a_server
 from langchain_ollama.llms import OllamaLLM
