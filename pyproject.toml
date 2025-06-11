@@ -6,7 +6,9 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "langchain-ollama>=0.3.3",
+    "langchain-openai>=0.3.22",
     "notebook>=7.4.3",
     "python-a2a>=0.5.9",
+    "python-dotenv>=1.1.0",
     "requests>=2.32.4",
 ]
