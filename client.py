@@ -3,6 +3,7 @@ import os
 import asyncio
 import logging
 import json
+import httpx
 
 # Add the 'src' directory to the Python path
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -16,19 +17,19 @@ from python_a2a import AgentNetwork, A2AClient, AIAgentRouter
 # Suppress python_a2a library's internal logging for cleaner output
 logging.getLogger("python_a2a").setLevel(logging.WARNING)
 
-# Make query_agent a regular synchronous function
-def query_agent(network, llm_client, router, query):
+async def query_agent(network, llm_client, router, query):
+    loop = asyncio.get_event_loop()
     print(f"\nQuery: {query}")
     
     try:
-        # router.route_query is SYNCHRONOUS, so NO 'await' here
-        agent_name, confidence = router.route_query(query) 
+        # router.route_query is a blocking call (we offload it to a separate thread to avoid blocking the async flow.)
+        agent_name, confidence = await loop.run_in_executor(None, router.route_query, query)
         print(f"Routing to {agent_name} with {confidence:.2f} confidence")
         
         agent = network.get_agent(agent_name)
         
-        # agent.ask is SYNCHRONOUS in this version of python-a2a
-        response = agent.ask(query) 
+        # agent.ask is a blocking call (we offload it to a separate thread to avoid blocking the async flow.)
+        response = await loop.run_in_executor(None, agent.ask, query)
         
         response_text = "No valid response or processing failed."
         
@@ -55,20 +56,48 @@ def query_agent(network, llm_client, router, query):
             
         print(f"Agent Response: {response_text}")
         
-        # Try to get LLM summary, but don't let it crash the whole process
         try:
-            # Create a shorter, more focused summary request
-            summary_request = f"Briefly summarize this trigonometry result: {response_text[:500]}"
-            llm_response = llm_client.ask(summary_request)
-            print(f"LLM Summary: {llm_response}")
+            print("DEBUG: Attempting raw httpx.post to LLM server for summary/ping.")
+            llm_server_url = "http://localhost:5001/tasks/send" 
+            ping_payload = {"message": {"content": {"text": "Hello LLM, this is a client ping."}}}
+
+            # Comment out the A2AClient based summary call
+            # summary_request = f"Briefly summarize this trigonometry result: {response_text[:500]}"
+            # temp_summary_llm_client = A2AClient("http://localhost:5001")
+            # # print("DEBUG: Created temporary LLM client for summary.")
+            # llm_response = await loop.run_in_executor(None, temp_summary_llm_client.ask, summary_request)
+            # print(f"LLM Summary: {llm_response}")
+
+            http_post_lambda = lambda: httpx.post(llm_server_url, json=ping_payload, timeout=10)
+            raw_response = await loop.run_in_executor(None, http_post_lambda)
+            
+            print(f"DEBUG: LLM raw status: {raw_response.status_code}")
+            # print(f"DEBUG: LLM raw response: {raw_response.text[:200]}") 
+            
+            if raw_response.status_code == 200:
+                response_json = raw_response.json()
+                llm_summary_text = "Could not extract text from raw response."
+
+                # Attempt to extract text, structure depends on A2AServer response
+                if response_json.get("result", {}).get("artifacts") and \
+                   len(response_json["result"]["artifacts"]) > 0 and \
+                   response_json["result"]["artifacts"][0].get("parts") and \
+                   len(response_json["result"]["artifacts"][0]["parts"]) > 0 and \
+                   "text" in response_json["result"]["artifacts"][0]["parts"][0]:
+                    llm_summary_text = response_json["result"]["artifacts"][0]["parts"][0]["text"]
+                elif response_json.get("message", {}).get("content", {}).get("text"): # Fallback for simple text responses
+                    llm_summary_text = response_json["message"]["content"]["text"]
+                print(f"LLM Ping/Summary (raw httpx): {llm_summary_text}")
+            else:
+                print(f"LLM Ping/Summary (raw httpx) Error: Status {raw_response.status_code} - {raw_response.text[:200]}")
+
         except Exception as e:
-            print(f"LLM Summary: Error - {str(e)}")
+            print(f"LLM Summary (raw httpx): Error - {str(e)}")
             
     except Exception as e:
         print(f"Error processing query '{query}': {str(e)}")
 
-# Main execution function, now synchronous
-def main():
+async def main():
     network = AgentNetwork(name="Trigonometry Assistant Network")
     
     agents = {
@@ -84,43 +113,31 @@ def main():
     router = AIAgentRouter(
         llm_client=llm_client, 
         agent_network=network,
-        system_prompt="""You are a highly precise routing agent for a trigonometry assistant network. Your task is to route user queries to the most appropriate agent based on their intent:
-
-ROUTING RULES:
-1. Route to 'coding' ONLY IF the query explicitly asks for Python code generation:
-   - Contains words: 'code', 'python', 'generate code', 'write code', 'script', 'function for', 'program'
-   - Examples: 'code for sine calculation', 'python function for angle sum', 'write a script for tangent'
-
-2. Route to 'trigonometry_math' for ALL other trigonometric queries:
-   - **Calculations:** 'sine of 30 degrees', 'calculate tan 1.57 radians', 'what is cos(45)?'
-   - **Identities/Formulas:** 'list basic identities', 'angle sum formulas', 'show double angle identities'
-   - **General questions:** 'what are cofunction formulas?', 'tell me about reciprocal identities'
-
-IMPORTANT: If unsure, default to 'trigonometry_math'. Only use 'coding' when code generation is explicitly requested.
-
-Return your response in the format: agent_name|confidence_score"""
+        system_prompt="You are an agent routing system. Based on the user's query, decide which agent is best suited to handle it. \
+            The available agents are 'trigonometry_math' for calculations and trigonometric identities, and 'coding' for generating Python code. \
+            Return your response in the format: agent_name|confidence_score. For confidence_score, use 1.0 if you are confident, or 0.5 if you are unsure. Example: 'coding|1.0'."
     )
     
     # Test queries
-    test_queries = [
-        "What is the sine of 30 degrees?",
-        "Calculate cos(π/4)",
-        "Write Python code to calculate sine and cosine",
-        "What are the basic trigonometric identities?",
-        "Generate a function for the law of cosines",
-        "Explain the unit circle",
-        "Code for converting degrees to radians",
-        "What is tan(45°)?",
-        "Show me the double angle formulas"
-    ]
+    # test_queries = [
+    #     "What is the sine of 30 degrees?",
+    #     "Calculate cos(π/4)",
+    #     "Write Python code to calculate sine and cosine",
+    #     "What are the basic trigonometric identities?",
+    #     "Generate a function for the law of cosines",
+    #     "Explain the unit circle",
+    #     "Code for converting degrees to radians",
+    #     "What is tan(45°)?",
+    #     "Show me the double angle formulas"
+    # ]
     
     print("=== Trigonometry Assistant Network Client ===")
-    print("Testing routing and responses...\n")
+    # print("Testing routing and responses...\n")
     
-    # Process each test query
-    for query in test_queries:
-        query_agent(network, llm_client, router, query)
-        print("-" * 60)
+    # # Process each test query
+    # for query in test_queries:
+    #     await query_agent(network, llm_client, router, query) # Ensure correct parameters
+    #     print("-" * 60)
     
     # Interactive mode
     print("\n=== Interactive Mode ===")
@@ -136,8 +153,9 @@ Return your response in the format: agent_name|confidence_score"""
             
             if not user_query:
                 continue
-                
-            query_agent(network, llm_client, router, user_query)
+            
+            # Ensure there's a query before running    
+            await query_agent(network, llm_client, router, user_query)
             print("-" * 40)
             
         except KeyboardInterrupt:
@@ -146,22 +164,21 @@ Return your response in the format: agent_name|confidence_score"""
         except Exception as e:
             print(f"Error: {e}")
 
-# Health check function - now synchronous
-def check_agents_health(network):
+async def check_agents_health(network):
     """Check if all agents are responding"""
+    loop = asyncio.get_event_loop()
     print("Checking agent health...")
     
     for agent_name in network.agents:
         try:
             agent = network.get_agent(agent_name)
-            # Simple health check query
-            response = agent.ask("ping")
+            # Simple health check query - agent.ask is blocking
+            response = await loop.run_in_executor(None, agent.ask, "ping")
             print(f"✓ {agent_name}: Online")
         except Exception as e:
             print(f"✗ {agent_name}: Offline - {str(e)}")
 
-# Enhanced main with health checks - now synchronous
-def main_with_health_check():
+async def main_with_health_check():
     """Main function with agent health verification"""
     network = AgentNetwork(name="Trigonometry Assistant Network")
     
@@ -173,16 +190,14 @@ def main_with_health_check():
     for name, url in agents.items():
         network.add(name, url)
     
-    # Check agent health first
-    check_agents_health(network)
+    await check_agents_health(network)
     
     # Continue with main execution
-    main()
+    await main()
 
 if __name__ == "__main__":
     try:
-        # Run the main function directly (no longer async)
-        main_with_health_check()
+        asyncio.run(main_with_health_check())
     except KeyboardInterrupt:
         print("\nApplication terminated by user.")
     except Exception as e:
